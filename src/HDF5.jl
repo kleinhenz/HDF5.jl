@@ -984,6 +984,9 @@ datatype(dset::Attribute) = Datatype(h5a_get_type(checkvalid(dset)), file(dset))
 # Create a datatype from in-memory types
 datatype(x::ScalarType) = Datatype(hdf5_type_id(typeof(x)), false)
 datatype(::Type{T}) where {T<:ScalarType} = Datatype(hdf5_type_id(T), false)
+datatype(::Type{AbstractArray{T}}) where T = datatype(T)
+datatype(::Type{AbstractArray{T}}) where {T<:ScalarType} = Datatype(hdf5_type_id(T), false)
+datatype(A::AbstractArray{T}) where T = datatype(T)
 datatype(A::AbstractArray{T}) where {T<:ScalarType} = Datatype(hdf5_type_id(T), false)
 function datatype(::Type{Complex{T}}) where {T<:ScalarType}
   COMPLEX_SUPPORT[] || error("complex support disabled. call HDF5.enable_complex_support() to enable")
@@ -1474,15 +1477,6 @@ function Base.setindex!(dset::Dataset, X::Array{T}, I::IndexType...) where T
     memtype = Datatype(h5t_get_native_type(filetype))  # padded layout in memory
     close(filetype)
 
-    elT = eltype(X)
-    if sizeof(elT) != h5t_get_size(memtype)
-        error("""
-              Type size mismatch
-              sizeof($elT) = $(sizeof(elT))
-              sizeof($memtype) = $(h5t_get_size(memtype))
-              """)
-    end
-
     dspace = dataspace(dset)
     stype = h5s_get_simple_extent_type(dspace)
     stype == H5S_NULL && error("attempting to write to null dataspace")
@@ -1497,7 +1491,7 @@ function Base.setindex!(dset::Dataset, X::Array{T}, I::IndexType...) where T
     end
 
     try
-        h5d_write(dset, memtype, memspace, dspace, dset.xfer, X)
+        d_write(dset, memtype, memspace, dspace, dset.xfer, X)
     finally
         close(memtype)
         close(memspace)
@@ -1693,8 +1687,6 @@ a_read(attr::Attribute, memtype::Datatype, buf) = h5a_read(attr, memtype, buf)
 a_write(attr::Attribute, memtype::Datatype, x) = h5a_write(attr, memtype, x)
 d_read(dset::Dataset, memtype::Datatype, buf, xfer::Properties=dset.xfer) =
     h5d_read(dset, memtype, H5S_ALL, H5S_ALL, xfer, buf)
-d_write(dset::Dataset, memtype::Datatype, x, xfer::Properties=dset.xfer) =
-    h5d_write(dset, memtype, H5S_ALL, H5S_ALL, xfer, x)
 
 # type-specific behaviors
 function a_write(attr::Attribute, memtype::Datatype, str::AbstractString)
@@ -1719,29 +1711,53 @@ function d_read(dataset::Dataset, memtype::Datatype, buf::AbstractArray, xfer::P
     h5d_read(dataset, memtype, H5S_ALL, H5S_ALL, xfer, buf)
 end
 
-function d_write(dataset::Dataset, memtype::Datatype, buf::AbstractArray, xfer::Properties=dataset.xfer)
-    stride(buf, 1) != 1 && throw(ArgumentError("Cannot write arrays with a different stride than `Array`"))
-    h5d_write(dataset, memtype, H5S_ALL, H5S_ALL, xfer, buf)
+# TODO interface for checking that type is compatible with specified datatype
+# TODO interface for distinguishing between scalar and array cases
+# TODO zero cost when possible
+
+# d_write generic interface
+function pack(X::AbstractArray)
+    stride(X, 1) != 1 && throw(ArgumentError("Cannot write arrays with a different stride than `Array`"))
+    return pack.(X)
 end
-function d_write(dataset::Dataset, memtype::Datatype, str::AbstractString, xfer::Properties=dataset.xfer)
-    strbuf = Base.cconvert(Cstring, str)
-    GC.@preserve strbuf begin
-        # unsafe_convert(Cstring, strbuf) is responsible for enforcing the no-'\0' policy,
-        # but then need explicit convert to Ptr{UInt8} since Ptr{Cstring} -> Ptr{Cvoid} is
-        # not automatic.
-        buf = convert(Ptr{UInt8}, Base.unsafe_convert(Cstring, strbuf))
-        h5d_write(dataset, memtype, H5S_ALL, H5S_ALL, xfer, buf)
+
+function pack(X::AbstractArray{T}) where T <: Union{BitsType, Complex{<:BitsType}}
+  stride(X, 1) != 1 && throw(ArgumentError("Cannot write arrays with a different stride than `Array`"))
+  return X
+end
+
+pack(x::Reference) = x
+pack(X::T) where T <: Union{BitsType, Complex{<:BitsType}} = Ref(X)
+pack(X::Array{<:AbstractString}) = Ref{Cstring}(X)
+function pack(X::AbstractString)
+    strbuf = Base.cconvert(Cstring, X)
+    buf = convert(Ptr{UInt8}, Base.unsafe_convert(Cstring, strbuf))
+    return buf
+end
+function pack(v::VLen)
+    len = length(v.data)
+    h = Vector{hvl_t}(undef, len)
+    for ii in 1:len
+        d = v.data[ii]
+        p = unsafe_convert(Ptr{UInt8}, d)
+        h[ii] = hvl_t(length(d), p)
+    end
+    return h
+end
+
+function d_write(dset::Dataset, memtype::Datatype, memspace::Dataspace, dspace::Dataspace, xfer::Properties, X)
+    GC.@preserve X begin
+        X_ = pack(X)
+        h5d_write(dset, memtype, memspace, dspace, xfer, X_)
     end
 end
-function d_write(dataset::Dataset, memtype::Datatype, x::T, xfer::Properties=dataset.xfer) where {T<:Union{ScalarType, Complex{<:ScalarType}}}
-    tmp = Ref{T}(x)
-    h5d_write(dataset, memtype, H5S_ALL, H5S_ALL, xfer, tmp)
-end
-function d_write(dataset::Dataset, memtype::Datatype, strs::Array{<:AbstractString}, xfer::Properties=dataset.xfer)
-    p = Ref{Cstring}(strs)
-    h5d_write(dataset, memtype, H5S_ALL, H5S_ALL, xfer, p)
-end
+
+# EmptyArray special case
 d_write(dataset::Dataset, memtype::Datatype, ::EmptyArray, xfer::Properties=dataset.xfer) = nothing
+
+function d_write(dataset::Dataset, memtype::Datatype, X, xfer::Properties=dataset.xfer)
+    d_write(dataset, memtype, Dataspace(H5S_ALL), Dataspace(H5S_ALL), xfer, X)
+end
 
 #h5s_get_simple_extent_ndims(space_id::hid_t) = h5s_get_simple_extent_ndims(space_id, C_NULL, C_NULL)
 h5t_get_native_type(type_id) = h5t_get_native_type(type_id, H5T_DIR_ASCEND)

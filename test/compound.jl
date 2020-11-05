@@ -20,7 +20,7 @@ struct foo_hdf5
     e::HDF5.hvl_t
 end
 
-function unsafe_convert(::Type{foo_hdf5}, x::foo)
+function HDF5.pack(x::foo)
     foo_hdf5(x.a,
             Base.unsafe_convert(Cstring, x.b),
             ntuple(i -> i <= ncodeunits(x.c) ? codeunit(x.c, i) : '\0', 20),
@@ -29,7 +29,7 @@ function unsafe_convert(::Type{foo_hdf5}, x::foo)
             )
 end
 
-function datatype(::Type{foo_hdf5})
+function datatype(::Type{foo})
     dtype = HDF5.h5t_create(HDF5.H5T_COMPOUND, sizeof(foo_hdf5))
     HDF5.h5t_insert(dtype, "a", fieldoffset(foo_hdf5, 1), datatype(Float64))
 
@@ -62,7 +62,7 @@ struct bar_hdf5
     a::NTuple{2, NTuple{20, UInt8}}
 end
 
-function datatype(::Type{bar_hdf5})
+function datatype(::Type{bar})
     dtype = HDF5.h5t_create(HDF5.H5T_COMPOUND, sizeof(bar_hdf5))
 
     fixedstr_dtype = HDF5.h5t_copy(HDF5.H5T_C_S1)
@@ -77,10 +77,9 @@ function datatype(::Type{bar_hdf5})
     HDF5.Datatype(dtype)
 end
 
-function convert(::Type{bar_hdf5}, x::bar)
+function HDF5.pack(x::bar)
     bar_hdf5(ntuple(i -> ntuple(j -> j <= ncodeunits(x.a[i]) ? codeunit(x.a[i], j) : '\0', 20), 2))
 end
-
 
 @testset "compound" begin
     N = 10
@@ -98,22 +97,12 @@ end
               rand(ComplexF64, 3,3),
               rand(1:10, rand(10:100)))
 
-    v_write = unsafe_convert.(foo_hdf5, v)
-
     w = [bar(["uniçº∂e", "hello"])]
-    w_write = convert.(bar_hdf5, w)
 
     fn = tempname()
     h5open(fn, "w") do h5f
-        foo_dtype = datatype(foo_hdf5)
-        foo_space = dataspace(v_write)
-        foo_dset = d_create(h5f, "foo", foo_dtype, foo_space)
-        d_write(foo_dset, foo_dtype, v_write)
-
-        bar_dtype = datatype(bar_hdf5)
-        bar_space = dataspace(w_write)
-        bar_dset = d_create(h5f, "bar", bar_dtype, bar_space)
-        d_write(bar_dset, bar_dtype, w_write)
+        h5f["foo"] = v
+        h5f["bar"] = w
     end
 
     v_read = h5read(fn, "foo")

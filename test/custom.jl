@@ -14,16 +14,15 @@ function datatype(::Type{Simple})
     HDF5.Datatype(dtype)
 end
 
+HDF5.pack(x::Simple) = x
+
 @testset "custom" begin
     N = 5
     v = [Simple(rand(Float64), rand(Int)) for i in 1:N, j in 1:N]
 
     fn = tempname()
     h5open(fn, "w") do h5f
-        dtype = datatype(Simple)
-        dspace = dataspace(v)
-        dset = d_create(h5f, "data", dtype, dspace)
-        d_write(dset, dtype, v)
+        h5f["data"] = v
     end
 
     h5open(fn, "r") do h5f
